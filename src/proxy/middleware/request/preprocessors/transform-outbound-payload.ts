@@ -38,7 +38,7 @@ const OpenAIV1ChatContentArraySchema = z.array(
   z.union([
     z.object({ type: z.literal("text"), text: z.string() }),
     z.object({
-      type: z.literal("image_url"),
+      type: z.union([z.literal("image"), z.literal("image_url")]),
       image_url: z.object({
         url: z.string().url(),
         detail: z.enum(["low", "auto", "high"]).optional().default("auto"),
@@ -52,9 +52,12 @@ export const OpenAIV1ChatCompletionSchema = z
     model: z.string().max(100),
     messages: z.array(
       z.object({
-        role: z.enum(["system", "user", "assistant"]),
+        role: z.enum(["system", "user", "assistant", "tool", "function"]),
         content: z.union([z.string(), OpenAIV1ChatContentArraySchema]),
         name: z.string().optional(),
+        tool_calls: z.array(z.any()).optional(),
+        function_call: z.array(z.any()).optional(),
+        tool_call_id: z.string().optional(),
       }),
       {
         required_error:
@@ -87,7 +90,24 @@ export const OpenAIV1ChatCompletionSchema = z
     logit_bias: z.any().optional(),
     user: z.string().max(500).optional(),
     seed: z.number().int().optional(),
+    // Be warned that Azure OpenAI combines these two into a single field.
+    // It's the only deviation from the OpenAI API that I'm aware of so I have
+    // special cased it in `addAzureKey` rather than expecting clients to do it.
+    logprobs: z.boolean().optional(),
+    top_logprobs: z.number().int().optional(),
+    // Quickly adding some newer tool usage params, not tested. They will be
+    // passed through to the API as-is.
+    tools: z.array(z.any()).optional(),
+    functions: z.array(z.any()).optional(),
+    tool_choice: z.any().optional(),
+    function_choice: z.any().optional(),
+    response_format: z.any(),
   })
+  // Tool usage must be enabled via config because we currently have no way to
+  // track quota usage for them or enforce limits.
+  .omit(
+    Boolean(config.allowOpenAIToolUsage) ? {} : { tools: true, functions: true }
+  )
   .strip();
 
 export type OpenAIChatMessage = z.infer<
@@ -116,7 +136,7 @@ const OpenAIV1TextCompletionSchema = z
     suffix: z.string().max(1000).optional(),
   })
   .strip()
-  .merge(OpenAIV1ChatCompletionSchema.omit({ messages: true }));
+  .merge(OpenAIV1ChatCompletionSchema.omit({ messages: true, logprobs: true }));
 
 // https://platform.openai.com/docs/api-reference/images/create
 const OpenAIV1ImagesGenerationSchema = z
@@ -185,7 +205,7 @@ const MistralAIV1ChatCompletionsSchema = z.object({
     .nullish()
     .transform((v) => Math.min(v ?? OPENAI_OUTPUT_MAX, OPENAI_OUTPUT_MAX)),
   stream: z.boolean().optional().default(false),
-  safe_mode: z.boolean().optional().default(false),
+  safe_prompt: z.boolean().optional().default(false),
   random_seed: z.number().int().optional(),
 });
 
@@ -210,6 +230,15 @@ export const transformOutboundPayload: RequestPreprocessor = async (req) => {
     !isTextGenerationRequest(req) && !isImageGenerationRequest(req);
 
   if (alreadyTransformed || notTransformable) return;
+
+  if (req.inboundApi === "mistral-ai") {
+    const messages = req.body.messages;
+    req.body.messages = fixMistralPrompt(messages);
+    req.log.info(
+      { old: messages.length, new: req.body.messages.length },
+      "Fixed Mistral prompt"
+    );
+  }
 
   if (sameService) {
     const result = VALIDATORS[req.inboundApi].safeParse(req.body);
@@ -279,11 +308,7 @@ function openaiToAnthropic(req: Request) {
   stops = [...new Set(stops)];
 
   return {
-    // Model may be overridden in `calculate-context-size.ts` to avoid having
-    // a circular dependency (`calculate-context-size.ts` needs an already-
-    // transformed request body to count tokens, but this function would like
-    // to know the count to select a model).
-    model: process.env.CLAUDE_SMALL_MODEL || "claude-v1",
+    model: rest.model,
     prompt: prompt,
     max_tokens_to_sample: rest.max_tokens,
     stop_sequences: stops,
@@ -521,4 +546,40 @@ function flattenOpenAIMessageContent(
         })
         .join("\n")
     : content;
+}
+
+function fixMistralPrompt(
+  messages: MistralAIChatMessage[]
+): MistralAIChatMessage[] {
+  // Mistral uses OpenAI format but has some additional requirements:
+  // - Only one system message per request, and it must be the first message if
+  //   present.
+  // - Final message must be a user message.
+  // - Cannot have multiple messages from the same role in a row.
+  // While frontends should be able to handle this, we can fix it here in the
+  // meantime.
+
+  const result = messages.reduce<MistralAIChatMessage[]>((acc, msg) => {
+    if (acc.length === 0) {
+      acc.push(msg);
+      return acc;
+    }
+    
+    const copy = { ...msg };
+    // Reattribute subsequent system messages to the user
+    if (msg.role === "system") {
+      copy.role = "user";
+    }
+
+    // Consolidate multiple messages from the same role
+    const last = acc[acc.length - 1];
+    if (last.role === copy.role) {
+      last.content += "\n\n" + copy.content;
+    } else {
+      acc.push(copy);
+    }
+    return acc;
+  }, []);
+
+  return result;
 }

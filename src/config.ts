@@ -16,6 +16,8 @@ export const USER_ASSETS_DIR = path.join(DATA_DIR, "user-files");
 type Config = {
   /** The port the proxy server will listen on. */
   port: number;
+  /** The network interface the proxy server will listen on. */
+  bindAddress: string;
   /** Comma-delimited list of OpenAI API keys. */
   openaiKey?: string;
   /** Comma-delimited list of Anthropic API keys. */
@@ -234,12 +236,21 @@ type Config = {
    * Defaults to 1, as most deployments are on HuggingFace or Cloudflare Tunnel.
    */
   trustedProxies?: number;
+  /**
+   * Whether to allow OpenAI tool usage.  The proxy doesn't impelment any
+   * support for tools/function calling but can pass requests and responses as
+   * is. Note that the proxy also cannot accurately track quota usage for
+   * requests involving tools, so you must opt in to this feature at your own
+   * risk.
+   */
+  allowOpenAIToolUsage?: boolean;
 };
 
 // To change configs, create a file called .env in the root directory.
 // See .env.example for an example.
 export const config: Config = {
   port: getEnvWithDefault("PORT", 7860),
+  bindAddress: getEnvWithDefault("BIND_ADDRESS", "0.0.0.0"),
   openaiKey: getEnvWithDefault("OPENAI_KEY", ""),
   anthropicKey: getEnvWithDefault("ANTHROPIC_KEY", ""),
   googleAIKey: getEnvWithDefault("GOOGLE_AI_KEY", ""),
@@ -323,6 +334,7 @@ export const config: Config = {
   useInsecureCookies: getEnvWithDefault("USE_INSECURE_COOKIES", isDev),
   staticServiceInfo: getEnvWithDefault("STATIC_SERVICE_INFO", false),
   trustedProxies: getEnvWithDefault("TRUSTED_PROXIES", 1),
+  allowOpenAIToolUsage: getEnvWithDefault("ALLOW_OPENAI_TOOL_USAGE", false),
 } as const;
 
 function generateCookieSecret() {
@@ -413,6 +425,7 @@ export const SENSITIVE_KEYS: (keyof Config)[] = ["googleSheetsSpreadsheetId"];
  */
 export const OMITTED_KEYS = [
   "port",
+  "bindAddress",
   "logLevel",
   "openaiKey",
   "anthropicKey",
